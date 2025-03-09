@@ -3,6 +3,8 @@ import torch
 from einops import rearrange
 import torch.nn as nn
 
+import pdb
+
 from .utils import exact_attention, exact_attention_cuda, add_self_attentions, indexing, get_distribution
 from .angular_lsh import AngularLSH, LSH
 
@@ -13,6 +15,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch.nn.functional as F
+
+from open_lm.attention import torch_attn, xformers_attn
 
 class HyperAttention(torch.nn.Module):
 
@@ -112,7 +116,7 @@ class HyperAttention(torch.nn.Module):
         _, key_sort_idx = torch.sort(self.lsh.hash(key), dim=2, stable=True)
         query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
 
-        get_distribution(query, query_sort, query_sort_idx_inv, self.lsh_num_projs, self.block_size, dim, self.lsh)
+        # get_distribution(query, query_sort, query_sort_idx_inv, self.lsh_num_projs, self.block_size, dim, self.lsh)
 
         key_block_size = self.block_size
 
@@ -281,242 +285,158 @@ class ReformerAttention(torch.nn.Module):
             attn = torch.sum(unsorted_dots[:, :, 0:query_len, :] * probs, dim=1)
 
         return out, attn
-    
-@dataclass(frozen=True)
-class RKForCompressionRatio:
-    """Config option to set r and k to achieve to specified compression ratio.
-
-    i.e. ratio = 8 means SparQ will transfer ~1/8 of the data that would be transferred
-    by dense.
-    """
-
-    ratio: int = 8
-    
-@dataclass(frozen=True)
-class SparQArgs:
-    rk: RKForCompressionRatio = RKForCompressionRatio(ratio=8)
-
-    reallocation: bool = True
-    running_V_mean: bool = True
-    K_mode: Literal["store_once", "store_twice"] = "store_twice"
-    # Sorting the output of the top-k takes time, but might result in more contiguous
-    # memory accesses. In our experiments we found it was faster not to sort.
-    sort_stage_1_top_k: bool = False
-    sort_stage_2_top_k: bool = False
-
-class RunningVMean(nn.Module):
-    """Maintains a running mean of V over sequence length.
-
-    FIXME: As the mean is accumulated for each token generated and reset of prefill,
-    this implementation is only correct if the nth token is only generated once per
-    prefill. The rest of gpt-fast doesn't enforce this, you can set input_pos to
-    generate the nth token as many times as you like, but we ignore this problem for
-    now.
-    """
-
-    def __init__(self, max_batch_size: int, n_local_heads: int, head_dim: int) -> None:
-        super().__init__()
-        self.register_buffer(
-            "V_mean",
-            torch.full(
-                (max_batch_size, n_local_heads, 1, head_dim),
-                float("nan"),
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer("n", torch.tensor(0))
-
-    def init(self, V: Tensor) -> None:
-        self.V_mean[:, :, :, :] = V.mean(-2, dtype=torch.float32, keepdim=True)
-        self.n.zero_().add_(V.shape[-2])
-
-    def update(self, v: Tensor) -> Tensor:
-        V_mean = (self.n * self.V_mean + v) / (self.n + 1)
-        self.V_mean[:, :, :, :] = V_mean
-        self.n.add_(1)
-        return V_mean.to(v.dtype)
-
 
 class PrefillQAttention(nn.Module):
-    def __init__(self, n_local_heads, input_dim = 128, lsh_num_projs=7, block_size=32, sample_size=1024) -> None:
+    def __init__(self, input_dim = 128, lsh_num_projs=7, block_size=32) -> None:
         super().__init__()
-        self.n_local_heads = n_local_heads
-        self.kv_cache: DoubleKVCache | SingleKVCache | None = None
-        self.V_mean: RunningVMean | None = None
-        self.r: int | None = None
-        self.k: int | None = None
-        self.K_mode = "store_twice"
         self.lsh_num_projs = lsh_num_projs
         self.lsh = AngularLSH(num_projs=lsh_num_projs, dim=(1, 1, input_dim))
         self.block_size = block_size
-        self.rk_ratio = 2
+
+    def visualize_lsh(self, q_lsh, k_lsh, layer_id, block_size):
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        for i in range(block_size, q_lsh.shape[0], block_size):
+            fig, ax = plt.subplots(1, 2, figsize=(20, 10))
+            ax[0].imshow(q_lsh[i-block_size:i].to(torch.float32).cpu().detach().numpy())
+            ax[0].set_title("q lsh sorted")
+            ax[1].imshow(k_lsh[i-block_size:i].to(torch.float32).cpu().detach().numpy())
+            ax[1].set_title("k")
+            plt.savefig(f"/home/lj9979/QUEST/tests/outputs/q_critical_layer_{layer_id}_{i/block_size}.png")
+            plt.close(fig)
+
+    def visualize_q_k(self, q, k, layer_id, seq_len):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib import cm
+
+        #plot a 3-d plot of q and k
+        q = q.mean(dim=0)
+        k = k.mean(dim=0)
+
+        q = q.view(seq_len, -1)
+        k = k.view(seq_len, -1)
+
+        x = np.arange(q.shape[1])
+        y = np.arange(q.shape[0])
+        X, Y = np.meshgrid(x, y)
+
+        q = q.cpu().to(torch.float32).detach().numpy()
+        k = k.cpu().to(torch.float32).detach().numpy()
+
+        q = abs(q)
+        k = abs(k)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(1, 2, 1, projection='3d')
+        ax.set_xlabel("Channels")
+        ax.set_ylabel("Tokens")
+        ax.plot_surface(X, Y, q, rstride=5, cstride=5, cmap=cm.coolwarm)
+        ax.set_title("blocked_tensor")
+        ax = fig.add_subplot(1, 2, 2, projection='3d')
+        ax.plot_surface(X, Y, k, rstride=5, cstride=5, cmap=cm.coolwarm)
+        ax.set_title("actual_tensor")
+        ax.set_xlabel("Channels")
+        ax.set_ylabel("Tokens")
+        plt.savefig(f"/home/lj9979/QUEST/tests/outputs/q_k_layer_{layer_id}.png")
+        plt.close(fig)
 
     def forward(
         self,
         q: Tensor,
         k: Tensor,
         v: Tensor,
+        is_causal: bool,
         mask: Tensor,
-        input_pos: Tensor | None,
-        prefill: bool,
     ) -> Tensor:
         self.n_head = q.shape[2]
+        seq_len = q.shape[1]
+        batch_size = q.shape[0]
+
+        out_dir = xformers_attn(q, k, v, True, mask)
+        
         q = q.transpose(1,2)
         k = k.transpose(1,2)
         v = v.transpose(1,2)
-        if self.kv_cache is not None:
-            K1, K2, V = self.kv_cache.update(input_pos, k, v)
 
-        K1 = K1.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        K2 = K2.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        V = V.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-
-        #    q: [batch x n heads         x target seq len x head embed dim]
-        #    K: [batch x n grouped heads x source seq len x head embed dim]
-        #    V: [batch x n grouped heads x source seq len x head embed dim]
-        # mask: [1     x 1               x 1              x source seq len]
-
-        if prefill:
-            return self._prefill(q, k, v, mask)
-        else:
-            return self._generate(q, K1, K2, V, v, mask)
-
-    def _prefill(self, q: Tensor, K: Tensor, V: Tensor, mask: Tensor) -> Tensor:
-        # self.V_mean.init(V)
         query_hash_sort, query_sort_idx = torch.sort(self.lsh.hash(q), dim=2, stable=True) # batch_size x head_size x n
+        query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
         num_blocks = q.shape[2] // self.block_size
-        query_block_size = q.shape[2] // num_blocks
+        query_block_size = self.block_size
         dim = q.shape[-1]
 
         query_sorted = indexing(q, query_sort_idx, query_block_size)
+        query_sorted = query_sorted.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
+        out_actual_1 = xformers_attn(query_sorted, k, v, True, mask)
+        out_actual_1 = out_actual_1.transpose(1,2)
+        out_actual_1 = indexing(out_actual_1, query_sort_idx_inv, query_block_size)
+        out_actual_1 = out_actual_1.transpose(1,2)
+        query_sorted = query_sorted.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
 
-        key_unsort = self.lsh.hash(K)
-        key_unsort_unsort_hash_block = key_unsort.view(-1, 1, query_block_size)
-        query_hash_sort_block = query_hash_sort.view(-1, 1, query_block_size)
+        # print(out_actual_1.shape)
+        # print(out_dir.shape)
+        # query_unsort = indexing(query_sorted, query_sort_idx_inv, query_block_size)
+
+        # assert torch.allclose(query_unsort, q, atol=1e-4)
+
+        # assert torch.allclose(out_actual_1, out_dir, atol=1e-4)
+
+        key_unsort = self.lsh.hash(k)
+        key_unsort_unsort_hash_block = key_unsort.view(seq_len, -1)
+        query_hash_sort_block = query_hash_sort.view(seq_len, -1)
 
         # Reshape tensors to [batch_size*head_size, 1, block_size, dim] as Flash-attn only allows 4d-tensors
-        query_split_per_block = query_sorted.view(-1, 1, query_block_size, dim)
-        K_split_per_block = K.reshape(-1, 1, query_block_size, dim)
-        V_split_per_block = V.reshape(-1, 1, query_block_size, dim)
+        query_split_per_block = query_sorted.view(batch_size, num_blocks, -1, dim)
+        K_split_per_block = k.reshape(batch_size, num_blocks, -1, dim)
+        V_split_per_block = v.reshape(batch_size, num_blocks, -1, dim)
 
-        # calculate criticality score
-        criticality = torch.sum(key_unsort_unsort_hash_block == query_hash_sort_block, dim=-1).squeeze()
-        critical_indices = torch.where(criticality > 0)
-        critical_mask = torch.ones_like(K_split_per_block)
-        critical_indices = critical_indices[0].cpu().tolist()
-        # torch.index_select(critical_mask, 0, critical_indices)
-        for x in critical_indices:
-            critical_mask[x, :, :, :] = 0
+        blocks_moved = 0
+        for i in range(0, num_blocks):
+            count = torch.sum(torch.eq(query_hash_sort_block[i*query_block_size:(i+1)*query_block_size, :], key_unsort_unsort_hash_block[i*query_block_size:(i+1)*query_block_size, :])).item()
+            if count == 0:
+                K_split_per_block[:, i, :, :] = 0
+            else:
+                blocks_moved += 1
+        
+        print("blocks moved:", blocks_moved)
+        q_critical = query_split_per_block.view(q.shape)
+        k_critical = K_split_per_block.view(k.shape)
+        v_critical = V_split_per_block.view(v.shape)
 
-        print("Number of blocks moved:", K_split_per_block.shape[0]-len(critical_indices))
+        q = q.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
 
-        K_split_per_block = K_split_per_block * critical_mask
+        q_critical = q_critical.transpose(1,2)
+        k_critical = k_critical.transpose(1,2)
+        v_critical = v_critical.transpose(1,2)
 
-        out_critical = F.scaled_dot_product_attention(query_split_per_block, K_split_per_block, V_split_per_block, mask)
-        out_actual = F.scaled_dot_product_attention(q, K, V, mask)
+        out_actual = xformers_attn(q_critical, k, v, True, mask)
+        out_actual = out_actual.transpose(1,2)
+        out_actual = indexing(out_actual, query_sort_idx_inv, query_block_size)
+        out_actual = out_actual.transpose(1,2)
 
-        out_critical = out_critical.view(out_actual.shape)
+        out_actual_no_sort = xformers_attn(q, k, v, True, mask)
+        
+        # self.visualize_q_k(q_critical, q, 0, seq_len)
+        # self.visualize_q_k(k_critical, k, 1, seq_len)
+
+        # assert torch.allclose(out_actual, out_actual_no_sort, atol=1e-4)
+
+        out_critical = xformers_attn(q_critical, k_critical, v_critical, True, mask)
+        out_critical = out_critical.transpose(1,2)
+        out_critical = indexing(out_critical, query_sort_idx_inv, query_block_size)
+        out_critical = out_critical.transpose(1,2)
+
+        print("out_critical shape:", out_critical.shape)
+        print("out_actual shape:", out_actual.shape)
 
         loss = ((out_critical - out_actual)**2).mean()
         print("loss after removing blocks:", loss.item())
         
-        return F.scaled_dot_product_attention(q, K, V, mask)
-
-    def _generate(
-        self, q: Tensor, K1: Tensor, K2: Tensor, V: Tensor, v: Tensor, mask: Tensor, config: SparQArgs
-    ) -> Tensor:
-        if config.reallocation and config.running_V_mean:
-            V_mean = self.V_mean.update(v)
-        elif config.reallocation and not config.running_V_mean:
-            V_mean = self._masked_V_mean(V, mask)
-        else:
-            V_mean = None
-        assert self.r is not None and self.k is not None
-        return self.sparq_attn(q, K1, K2, V, V_mean, mask, self.r, self.k, self.config)
-
-    def _masked_V_mean(self, V: Tensor, mask: Tensor) -> Tensor:
-        value_mask = mask.transpose(-2, -1)
-        V_sum = (V * value_mask).sum(-2, dtype=torch.float32, keepdim=True)
-        V_mean = V_sum / value_mask.sum(-2, dtype=torch.float32, keepdim=True)
-        return V_mean.to(V.dtype)
-    
-    def get_r_k_for_compression_ratio(
-        self,
-        sequence_length: int, head_dim: int
-    ) -> tuple[int, int]:
-        """Gets r, k to reduce memory transferred during attention by the given ratio."""
-        r = round(head_dim / self.rk_ratio)
-        k = round(sequence_length / (2 * self.rk_ratio))
-        return r, k
-    
-    def setup_caches(
-        self,
-        max_batch_size: int,
-        max_seq_length: int,
-        n_heads: int,
-        head_dim: int,
-        dtype=torch.bfloat16,
-    ) -> None:
-        if self.K_mode == "store_twice":
-            self.kv_cache = DoubleKVCache(
-                max_batch_size, max_seq_length, n_heads, head_dim, dtype
-            )
-        elif self.K_mode == "store_once":
-            self.kv_cache = SingleKVCache(
-                max_batch_size, max_seq_length, n_heads, head_dim, dtype
-            )
-
-        self.V_mean = RunningVMean(max_batch_size, n_heads, head_dim)
-        self.r, self.k = self.get_r_k_for_compression_ratio(
-            max_seq_length, head_dim
-        )
-
-    @torch.compile(disable=not torch.cuda.is_available())
-    def _scaled_softmax(self, x: Tensor, divscale: Tensor | float, dim: int) -> Tensor:
-        return torch.softmax(x / divscale, dim=dim)
-
-    def sparq_attn(
-        self,
-        Q: Tensor,
-        K1: Tensor,
-        K2: Tensor,
-        V: Tensor,
-        V_mean: Tensor | None,
-        mask: Tensor,
-        r: int,
-        k: int,
-        config: SparQArgs,
-    ) -> Tensor:
-        # 1. Approximate attention scores using r largest components of Q
-        absQ = torch.abs(Q)
-        absQ_hat, i1 = torch.topk(absQ, r, dim=-1, sorted=config.sort_stage_1_top_k)
-        QK_hat = _gather(Q, -1, i1) @ _gather(K1, -1, i1).transpose(-1, -2)
-        masked_QK_hat = torch.where(mask, QK_hat, float("-inf"))
-        scale = torch.sqrt(
-            Q.shape[-1]
-            * absQ_hat.sum(dim=-1, keepdim=True)
-            / absQ.sum(dim=-1, keepdim=True)
-        )
-        s_hat = self._scaled_softmax(masked_QK_hat, scale, dim=-1)
-
-        # 2. Gather top k2 positions based on approximate attention scores & run attention
-        # This min ensures that k <= sequence length, otherwise torch.compile() will crash.
-        k = min(k, V.shape[-2])
-        s_hat_i2, i2 = torch.topk(s_hat, k, dim=-1, sorted=config.sort_stage_2_top_k)
-        iKV = i2[..., 0, :, None]
-        QK = Q @ _gather(K2, -2, iKV).transpose(2, 3)
-        masked_QK = torch.where(_gather(mask.expand_as(QK_hat), -1, i2), QK, float("-inf"))
-        s = self._scaled_softmax(masked_QK, Q.shape[-1] ** 0.5, dim=-1)
-        y_ = s @ _gather(V, -2, iKV)
-
-        # 3. Estimate the total score of the top k, and interpolate with V_mean
-        if V_mean is not None:
-            return torch.lerp(V_mean, y_, s_hat_i2.sum(-1, keepdim=True))
-        else:
-            return y_
-
-
-def _gather(t: Tensor, dim: int, i: Tensor) -> Tensor:
-    dim += (dim < 0) * t.ndim
-    return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
-
+        return out_critical
