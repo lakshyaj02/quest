@@ -33,6 +33,9 @@ def patch_attention_layers(model_config, model_name, patch_config, num_patch_lay
 
     elif patch_config == 'even_last':
         patch_layer_indices = range(1, num_total_layers, 2)[-num_patch_layers:]
+    
+    elif patch_config == 'first_only':
+        patch_layer_indices = [0]
 
     else:
         raise NotImplementedError(f"Invalid patch_config option: {patch_config}")
@@ -51,16 +54,16 @@ def patch_attention_layers(model_config, model_name, patch_config, num_patch_lay
         for i in patch_layer_indices:
             model_config.transformer.encoder.layers[i].self_attention.core_attention = FastCoreAttention(model_config.config, i, **kwargs)
     
-    elif model_name == 'opt-350m-32k':
-        from .modeling_fast_attention import FastCoreAttention
+    elif model_name == 'opt-350m-50k':
+        from .modeling_fast_attention import CustomOPTAttn
     
         print(f"patch_config: {patch_config}, attn_method: {kwargs['attn_method']}, num_patch_layers: {num_patch_layers}, patch_indices: {list(patch_layer_indices)}")
         for i in patch_layer_indices:
-            model_config.model.decoder.layers[i].self_attn.core_attention = FastCoreAttention(model_config.config, i, **kwargs)
+            model_config.model.decoder.layers[i].self_attn = CustomOPTAttn(model_config.config, i, **kwargs)
 
     elif model_name == 'open_lm_1b':
         from .modeling_fast_attention import CustomOpenLmAttn
     
         print(f"patch_config: {patch_config}, attn_method: {kwargs['attn_method']}, num_patch_layers: {num_patch_layers}, patch_indices: {list(patch_layer_indices)}")
         for i in patch_layer_indices:
-            model_config.layers[i].attention = CustomOpenLmAttn(kwargs['param_config'], i, **kwargs)
+            model_config.model.layers[i].attention.attn_fn = CustomOpenLmAttn(kwargs['param_config'], i, **kwargs)
