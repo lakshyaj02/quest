@@ -10,6 +10,9 @@ from transformers import AutoConfig, GPT2Tokenizer
 from transformers import GPTNeoXTokenizerFast
 from open_lm.model import create_model, create_params
 
+from open_lm.utils.transformers.hf_model import OpenLMforCausalLM
+from open_lm.utils.transformers.hf_config import OpenLMConfig
+
 from typing import Callable
 from open_lm.attention import get_attn_func, xformers_attn, torch_attn
 
@@ -91,6 +94,8 @@ def perplexity_eval(model, encoded_texts, args, device):
 
         pbar.set_description(f"[{bid:<4}/{len(encoded_texts)}] avg_ppls: {np.mean(np.array(ppls)[~np.isnan(np.array(ppls))]):.4f}")
         
+        torch.cuda.memory_summary(device=0, abbreviated=True)
+        
         del out_logits, encoded_batch, attn_mask, shift_logits, shift_labels, shift_attention_mask_batch, perplexity_batch
         
 
@@ -119,16 +124,12 @@ def get_model_and_tokenizer(model_name, args):
 
     elif model_name == 'open_lm_1b':
         checkpoint = torch.load('/home/lj9979/QUEST/models/open_lm_1b.pt')
-        model = create_model(args).half()
+        model = OpenLMforCausalLM(OpenLMConfig(create_params(args)))
+        # model = create_model(args).half()
         state_dict = checkpoint["state_dict"]
         state_dict = {x.replace("module.", ""): y for x, y in state_dict.items()}
-        model.load_state_dict(state_dict)
+        model.model.load_state_dict(state_dict)
         tokenizer = GPTNeoXTokenizerFast.from_pretrained("EleutherAI/gpt-neox-20b")
-        model.to(device="cuda", dtype=torch.bfloat16)
-        model.eval()
-        print("performing perplexity evaluation on open_lm_1b")
-        encoded_texts = load_encoded_texts(tokenizer, args)
-        perplexity_eval(model.to("cuda"), encoded_texts, args, device="cuda")
     else:
         raise NotImplementedError("Currently we only support chatglm2")
             
@@ -136,18 +137,18 @@ def get_model_and_tokenizer(model_name, args):
 
 def get_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seq_len", type=int, default=32768)
+    parser.add_argument("--seq_len", type=int, default=4096) # 32768
     # patch config
-    parser.add_argument("--patch_config", type=str, default="odd", choices=['last', 'first', 'even', 'odd'])
+    parser.add_argument("--patch_config", type=str, default="first", choices=['last', 'first', 'even', 'odd', 'first_only'])
     parser.add_argument("--attn_method", type=str, default="prefill", choices=['flash', 'hyper', 'hyper-cuda', 'prefill'])
     parser.add_argument("--num_patch_layers", type=int, default=-1)
     # params of HyperAttention
-    parser.add_argument("--block_size", type=int, default=256)
-    parser.add_argument("--sample_size", type=int, default=256)
+    parser.add_argument("--block_size", type=int, default=32)
+    parser.add_argument("--sample_size", type=int, default=32)
     parser.add_argument("--lsh_num_projs", type=int, default=7)
     parser.add_argument("--min_seq_len", type=int, default=4096)
     # currently only supports **chatglm2-6b-32k**
-    parser.add_argument("--model_name", type=str, default="open_lm_1b", choices=['open_lm_1b', 'glm-edge-1.5b-chat', 'chatglm2-6b-32k', 'opt-350m-32k'])
+    parser.add_argument("--model_name", type=str, default="open_lm_1b", choices=['open_lm_1b', 'glm-edge-1.5b-chat', 'chatglm2-6b-32k', 'opt-350m-50k'])
     # args for the open_lm model
     parser.add_argument("--checkpoint", default="/home/lj9979/QUEST/models/open_lm_1b.pt")
     # TODO: Make this take as input --model-config, similar to generate.py
@@ -200,7 +201,14 @@ def main():
             continue
         encoded_texts.append(encoded_text)
     print(f"# of data longer than {args.seq_len}: {len(encoded_texts)}")
-    
+
+    model.to(device=device, dtype=dtype)
+    model.eval()
+    loss_fct = CrossEntropyLoss(reduction="none")
+
+    # print("performing perplexity evaluation on open_lm_1b")
+    # perplexity_eval(model, encoded_texts, args, device="cuda")
+
     if args.attn_method != 'flash':
         patch_attention_layers(model_config=model, **args.__dict__)
 
@@ -210,6 +218,7 @@ def main():
 
     ppls = []
 
+    encoded_texts = encoded_texts[:10]
     pbar = tqdm(range(len(encoded_texts)))
     for bid in pbar:
         encoded_batch = encoded_texts[bid:bid+1]
